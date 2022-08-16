@@ -1,3 +1,5 @@
+use std::iter::{Flatten, Take};
+
 fn dezig(value: i32) -> i32 {
     if (value & 1) != 0 {
         !(value >> 1)
@@ -211,22 +213,40 @@ pub struct AttributeIterator<'a, const BYTE_STRIDE: usize> {
 }
 
 impl<'a, const BYTE_STRIDE: usize> AttributeIterator<'a, BYTE_STRIDE> {
-    pub fn new(bytes: &'a [u8], element_count: usize, filter: Option<Filter>) -> Option<Self> {
-        Some(Self {
-            tail_data: (&bytes[bytes.len().checked_sub(BYTE_STRIDE)?..])
-                .try_into()
-                .ok()?,
-            filter,
-            bytes: &bytes[1..],
-            attr_block_max_element_count: ((8192 / BYTE_STRIDE) % !15).min(256),
-            remaining_elements: element_count,
-        })
+    pub fn new(
+        bytes: &'a [u8],
+        element_count: usize,
+        filter: Option<Filter>,
+    ) -> Option<Take<Flatten<Self>>> {
+        let attr_block_max_element_count = ((8192 / BYTE_STRIDE) % !15).min(256);
+
+        if attr_block_max_element_count != 256 {
+            panic!(
+                "Expected a block element count of 255: {}",
+                attr_block_max_element_count
+            );
+        }
+
+        Some(
+            Self {
+                tail_data: (&bytes[bytes.len().checked_sub(BYTE_STRIDE)?..])
+                    .try_into()
+                    .ok()?,
+                filter,
+                bytes: &bytes[1..],
+                attr_block_max_element_count,
+                remaining_elements: element_count,
+            }
+            .flatten()
+            .take(element_count),
+        )
     }
 }
 
 impl<'a, const BYTE_STRIDE: usize> Iterator for AttributeIterator<'a, BYTE_STRIDE> {
     type Item = [[u8; BYTE_STRIDE]; 256];
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining_elements == 0 {
             return None;
@@ -235,7 +255,6 @@ impl<'a, const BYTE_STRIDE: usize> Iterator for AttributeIterator<'a, BYTE_STRID
         let attr_block_element_count = self
             .remaining_elements
             .min(self.attr_block_max_element_count);
-        self.remaining_elements -= attr_block_element_count;
 
         let group_count = div_ceil(attr_block_element_count, 16);
         let header_byte_count = div_ceil(group_count, 4);
@@ -249,7 +268,7 @@ impl<'a, const BYTE_STRIDE: usize> Iterator for AttributeIterator<'a, BYTE_STRID
             for group in 0..group_count {
                 let header_byte = header_bytes[group / 4];
 
-                let mode = (header_byte >> ((group % 4) / 2)) & 0x3;
+                let mode = (header_byte >> ((group % 4) * 2)) & 0x3;
 
                 let mut deltas = [0; 16];
 
@@ -306,29 +325,40 @@ impl<'a, const BYTE_STRIDE: usize> Iterator for AttributeIterator<'a, BYTE_STRID
         }
 
         if let Some(filter) = self.filter {
-            for element in &mut output_elements {
+            for element in &mut output_elements[..self.remaining_elements.min(256)] {
                 filter_element(element, BYTE_STRIDE, filter);
             }
         }
 
+        self.remaining_elements -= attr_block_element_count;
         Some(output_elements)
     }
 }
 
+// Seems to be significantly faster than f32::round.
+// Essentially does a simd mask select without the simd.
+#[inline]
+fn approx_round(value: f32) -> f32 {
+    value - 0.5 + ((value >= 0.0) as u8 as f32)
+}
+
+#[inline]
 fn filter_element(input: &mut [u8], byte_stride: usize, filter: Filter) {
     match filter {
         Filter::Octahedral => {
-            let (mut x, mut y, one) = if byte_stride == 4 {
+            let (mut x, mut y, one, max_int) = if byte_stride == 4 {
                 (
                     (input[0] as i8) as f32,
                     (input[1] as i8) as f32,
                     (input[2] as i8) as f32,
+                    127.0,
                 )
             } else {
                 (
                     i16::from_le_bytes([input[0], input[1]]) as f32,
                     i16::from_le_bytes([input[2], input[3]]) as f32,
                     i16::from_le_bytes([input[4], input[5]]) as f32,
+                    32767.0,
                 )
             };
 
@@ -341,24 +371,24 @@ fn filter_element(input: &mut [u8], byte_stride: usize, filter: Filter) {
             x -= t.copysign(x);
             y -= t.copysign(y);
 
-            let len = (x * x + y * y + z * z).sqrt();
+            let normalize_and_multiply = max_int / (x * x + y * y + z * z).sqrt();
 
-            x /= len;
-            y /= len;
-            z /= len;
+            x *= normalize_and_multiply;
+            y *= normalize_and_multiply;
+            z *= normalize_and_multiply;
 
             if byte_stride == 4 {
-                input[0] = ((x * 127.0).round() as i8) as u8;
-                input[1] = ((y * 127.0).round() as i8) as u8;
-                input[2] = ((z * 127.0).round() as i8) as u8;
+                input[0] = approx_round(x) as i8 as u8;
+                input[1] = approx_round(y) as i8 as u8;
+                input[2] = approx_round(z) as i8 as u8;
             } else {
-                let x = (x * 32767.0).round() as i16 as u16;
+                let x = approx_round(x) as i16 as u16;
                 input[0..2].copy_from_slice(&x.to_le_bytes());
 
-                let y = (y * 32767.0).round() as i16 as u16;
+                let y = approx_round(y) as i16 as u16;
                 input[2..4].copy_from_slice(&y.to_le_bytes());
 
-                let z = (z * 32767.0).round() as i16 as u16;
+                let z = approx_round(z) as i16 as u16;
                 input[4..6].copy_from_slice(&z.to_le_bytes());
             }
         }
@@ -370,20 +400,20 @@ fn filter_element(input: &mut [u8], byte_stride: usize, filter: Filter) {
             let input_2 = i16::from_le_bytes([input[4], input[5]]);
             let input_3 = i16::from_le_bytes([input[6], input[7]]);
 
-            let range = std::f32::consts::FRAC_1_SQRT_2;
-
             let one = (input_3 | 3) as f32;
 
-            let x = input_0 as f32 / one * range;
-            let y = input_1 as f32 / one * range;
-            let z = input_2 as f32 / one * range;
+            let normalize = std::f32::consts::FRAC_1_SQRT_2 / one;
+
+            let x = input_0 as f32 * normalize;
+            let y = input_1 as f32 * normalize;
+            let z = input_2 as f32 * normalize;
 
             let w = (0.0_f32).max(1.0 - x * x - y * y - z * z).sqrt();
 
-            let x = ((x * 32767.0).round() as i16).to_le_bytes();
-            let y = ((y * 32767.0).round() as i16).to_le_bytes();
-            let z = ((z * 32767.0).round() as i16).to_le_bytes();
-            let w = ((w * 32767.0).round() as i16).to_le_bytes();
+            let x = (approx_round(x * 32767.0) as i16).to_le_bytes();
+            let y = (approx_round(y * 32767.0) as i16).to_le_bytes();
+            let z = (approx_round(z * 32767.0) as i16).to_le_bytes();
+            let w = (approx_round(w * 32767.0) as i16).to_le_bytes();
 
             let maxcomp = input_3 & 3;
 
@@ -412,6 +442,7 @@ fn filter_element(input: &mut [u8], byte_stride: usize, filter: Filter) {
     }
 }
 
+#[inline]
 fn div_ceil(dividend: usize, divisor: usize) -> usize {
     (dividend + (divisor - 1)) / divisor
 }
@@ -421,6 +452,7 @@ fn test_div_ceil() {
     assert_eq!(div_ceil(5, 2), 3);
 }
 
+#[inline]
 fn split_byte(byte: u8) -> (u8, u8) {
     (byte >> 4, byte & 0x0f)
 }
@@ -534,8 +566,6 @@ fn decode_vertex_buffer() {
         AttributeIterator::<12>::new(&encoded, 4, None)
             .unwrap()
             .flatten()
-            .take(4)
-            .flatten()
             .collect::<Vec<_>>(),
         expected
     );
@@ -558,8 +588,6 @@ fn decode_vertex_buffer_more() {
     assert_eq!(
         AttributeIterator::<4>::new(&encoded, 16, None)
             .unwrap()
-            .flatten()
-            .take(16)
             .flatten()
             .collect::<Vec<_>>(),
         expected
@@ -586,8 +614,6 @@ fn decode_vertex_buffer_more_2() {
         AttributeIterator::<4>::new(&encoded, 16, None)
             .unwrap()
             .flatten()
-            .take(16)
-            .flatten()
             .collect::<Vec<_>>(),
         &expected
     );
@@ -607,8 +633,6 @@ fn decode_filter_oct_8() {
     assert_eq!(
         AttributeIterator::<4>::new(&encoded, 4, Some(Filter::Octahedral))
             .unwrap()
-            .flatten()
-            .take(4)
             .flatten()
             .collect::<Vec<_>>(),
         &expected
@@ -632,8 +656,6 @@ fn decode_filter_oct_12() {
     assert_eq!(
         AttributeIterator::<8>::new(&encoded, 4, Some(Filter::Octahedral))
             .unwrap()
-            .flatten()
-            .take(4)
             .flat_map(|bytes| [
                 u16::from_le_bytes([bytes[0], bytes[1]]),
                 u16::from_le_bytes([bytes[2], bytes[3]]),
@@ -662,8 +684,6 @@ fn decode_filter_quat_12() {
     assert_eq!(
         AttributeIterator::<8>::new(&encoded, 4, Some(Filter::Quaternion))
             .unwrap()
-            .flatten()
-            .take(4)
             .flat_map(|bytes| [
                 u16::from_le_bytes([bytes[0], bytes[1]]),
                 u16::from_le_bytes([bytes[2], bytes[3]]),
@@ -689,8 +709,6 @@ fn decode_filter_exp() {
     assert_eq!(
         AttributeIterator::<16>::new(&encoded, 1, Some(Filter::Exponential))
             .unwrap()
-            .flatten()
-            .take(1)
             .flat_map(|bytes| [
                 u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
                 u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
@@ -699,5 +717,29 @@ fn decode_filter_exp() {
             ])
             .collect::<Vec<_>>(),
         &expected
+    );
+}
+
+#[test]
+fn decode_real_vertex_buffer() {
+    let compressed_bytes = std::fs::read("test_data/vertex_buffer.compressed.bin").unwrap();
+
+    assert_eq!(
+        AttributeIterator::<4>::new(&compressed_bytes, 3678936, Some(Filter::Octahedral))
+            .unwrap()
+            .count(),
+        3678936
+    );
+}
+
+#[test]
+fn decode_real_vertex_buffer_quat() {
+    let compressed_bytes = std::fs::read("test_data/vertex_buffer_quat.compressed.bin").unwrap();
+
+    assert_eq!(
+        AttributeIterator::<8>::new(&compressed_bytes, 1788, Some(Filter::Quaternion))
+            .unwrap()
+            .count(),
+        1788
     );
 }
