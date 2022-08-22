@@ -1,12 +1,12 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
-fn bench_real_index_buffer(c: &mut Criterion) {
-    let comp_bytes = std::fs::read("test_data/index_buffer.compressed.bin").unwrap();
-
-    let num_indices = 54348;
-    let num_trianges = num_indices / 3;
-
+fn bench_group(c: &mut Criterion) {
     c.bench_function("bench_real_index_buffer", |b| {
+        let comp_bytes = std::fs::read("test_data/triangles_comp.bin").unwrap();
+
+        let num_indices = 4995564;
+        let num_trianges = num_indices / 3;
+
         b.iter(|| {
             let iter = meshopt_decoder::TriangleIterator::new(&comp_bytes, num_indices).unwrap();
             let mut got = 0;
@@ -19,12 +19,27 @@ fn bench_real_index_buffer(c: &mut Criterion) {
             assert_eq!(got, num_trianges);
         })
     });
-}
 
-fn bench_real_vertex_buffer(c: &mut Criterion) {
-    let compressed_bytes = std::fs::read("test_data/vertex_buffer.compressed.bin").unwrap();
+    c.bench_function("bench_real_vertex_buffer_positions", |b| {
+        let compressed_bytes = std::fs::read("test_data/positions_comp.bin").unwrap();
 
-    c.bench_function("bench_real_vertex_buffer", |b| {
+        b.iter(|| {
+            let mut count = 0;
+
+            for x in meshopt_decoder::AttributeIterator::<8>::new(&compressed_bytes, 3678936, None)
+                .unwrap()
+            {
+                black_box(x);
+                count += 1;
+            }
+
+            assert_eq!(count, 3678936)
+        })
+    });
+
+    c.bench_function("bench_real_vertex_buffer_normals", |b| {
+        let compressed_bytes = std::fs::read("test_data/normals_comp.bin").unwrap();
+
         b.iter(|| {
             let mut count = 0;
 
@@ -42,12 +57,61 @@ fn bench_real_vertex_buffer(c: &mut Criterion) {
             assert_eq!(count, 3678936)
         })
     });
-}
 
-fn bench_real_vertex_buffer_quaternion(c: &mut Criterion) {
-    let compressed_bytes = std::fs::read("test_data/vertex_buffer_quat.compressed.bin").unwrap();
+    c.bench_function("bench_real_vertex_buffer_normals_vec", |b| {
+        let compressed_bytes = std::fs::read("test_data/normals_comp.bin").unwrap();
+
+        b.iter(|| {
+            let vec = meshopt_decoder::decompress_attributes_to_vec(&compressed_bytes, 3678936, Some(meshopt_decoder::Filter::Octahedral), 4).unwrap();
+
+            let vec = black_box(vec);
+
+            assert_eq!(vec.len(), 3678936 * 4)
+        })
+    });
+
+    c.bench_function("bench_real_vertex_buffer_uvs", |b| {
+        let compressed_bytes = std::fs::read("test_data/uvs_comp.bin").unwrap();
+
+        b.iter(|| {
+            let mut count = 0;
+
+            for x in meshopt_decoder::AttributeIterator::<4>::new(&compressed_bytes, 3678936, None)
+                .unwrap()
+            {
+                black_box(x);
+                count += 1;
+            }
+
+            assert_eq!(count, 3678936)
+        })
+    });
+
+    c.bench_function("bench_real_vertex_buffer_octahedral", |b| {
+        let compressed_bytes = std::fs::read("test_data/vertex_buffer.compressed.bin").unwrap();
+
+        b.iter(|| {
+            let mut count = 0;
+
+            for x in meshopt_decoder::AttributeIterator::<4>::new(
+                &compressed_bytes,
+                3678936,
+                Some(meshopt_decoder::Filter::Octahedral),
+            )
+            .unwrap()
+            {
+                black_box(x);
+                count += 1;
+            }
+
+            assert_eq!(count, 3678936)
+        })
+    });
 
     c.bench_function("bench_real_vertex_buffer_quaternion", |b| {
+        let compressed_bytes =
+            std::fs::read("test_data/vertex_buffer_quat.compressed.bin").unwrap();
+
         b.iter(|| {
             let mut count = 0;
 
@@ -67,10 +131,5 @@ fn bench_real_vertex_buffer_quaternion(c: &mut Criterion) {
     });
 }
 
-criterion_group!(
-    benches,
-    bench_real_index_buffer,
-    bench_real_vertex_buffer,
-    bench_real_vertex_buffer_quaternion
-);
+criterion_group!(benches, bench_group,);
 criterion_main!(benches);

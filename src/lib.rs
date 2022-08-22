@@ -1,5 +1,6 @@
 use std::iter::{Flatten, Take};
 
+#[inline]
 fn dezig(value: i32) -> i32 {
     if (value & 1) != 0 {
         !(value >> 1)
@@ -221,10 +222,10 @@ impl<'a, const BYTE_STRIDE: usize> AttributeIterator<'a, BYTE_STRIDE> {
         let attr_block_max_element_count = ((8192 / BYTE_STRIDE) % !15).min(256);
 
         if attr_block_max_element_count != 256 {
-            panic!(
+            /*panic!(
                 "Expected a block element count of 255: {}",
                 attr_block_max_element_count
-            );
+            );*/
         }
 
         Some(
@@ -335,11 +336,107 @@ impl<'a, const BYTE_STRIDE: usize> Iterator for AttributeIterator<'a, BYTE_STRID
     }
 }
 
-// Seems to be significantly faster than f32::round.
-// Essentially does a simd mask select without the simd.
-#[inline]
-fn approx_round(value: f32) -> f32 {
-    value - 0.5 + ((value >= 0.0) as u8 as f32)
+pub fn decompress_attributes_to_vec(
+    mut bytes: &[u8],
+    element_count: usize,
+    filter: Option<Filter>,
+    byte_stride: usize,
+) -> Option<Vec<u8>> {
+    let attr_block_max_element_count = ((8192 / byte_stride) % !15).min(256);
+
+    let mut tail_data = bytes[bytes.len().checked_sub(byte_stride)?..].to_vec();
+
+    bytes = &bytes[1..];
+
+    let mut output_bytes = vec![0; element_count * byte_stride];
+
+    let mut remaining_elements = element_count;
+
+    let mut element_offset = 0;
+
+    while remaining_elements > 0 {
+        let attr_block_element_count = remaining_elements.min(attr_block_max_element_count);
+
+        let group_count = div_ceil(attr_block_element_count, 16);
+        let header_byte_count = div_ceil(group_count, 4);
+
+        for byte in 0..byte_stride {
+            let header_bytes = bytes.get(..header_byte_count)?;
+            bytes = bytes.get(header_byte_count..)?;
+
+            for group in 0..group_count {
+                let header_byte = header_bytes[group / 4];
+
+                let mode = (header_byte >> ((group % 4) * 2)) & 0x3;
+
+                let mut deltas = [0; 16];
+
+                match mode {
+                    0 => {}
+                    1 => {
+                        let sentinel_deltas = &bytes.get(..4)?;
+                        bytes = bytes.get(4..)?;
+
+                        for i in 0..16 {
+                            let shift = 6 - ((i & 0x3) * 2);
+                            let delta = (sentinel_deltas[i / 4] >> shift) & 0x3;
+                            if delta == 0x3 {
+                                let (&delta, split_bytes) = bytes.split_first()?;
+                                deltas[i] = delta;
+                                bytes = split_bytes;
+                            } else {
+                                deltas[i] = delta;
+                            }
+                        }
+                    }
+                    2 => {
+                        let sentinel_deltas = &bytes.get(..8)?;
+                        bytes = bytes.get(8..)?;
+                        for i in 0..16 {
+                            let shift = if i % 2 == 1 { 0 } else { 4 };
+
+                            let delta = (sentinel_deltas[i / 2] >> shift) & 0xf;
+
+                            if delta == 0xf {
+                                let (&delta, split_bytes) = bytes.split_first()?;
+                                deltas[i] = delta;
+                                bytes = split_bytes;
+                            } else {
+                                deltas[i] = delta;
+                            }
+                        }
+                    }
+                    _ => {
+                        deltas.copy_from_slice(bytes.get(..16)?);
+                        bytes = bytes.get(16..)?;
+                    }
+                }
+
+                for i in 0..16 {
+                    let dst_elem = group * 16 + i;
+
+                    tail_data[byte] = (tail_data[byte] as i32 + dezig(deltas[i] as i32)) as u8;
+
+                    if let Some(output_byte) =
+                        output_bytes.get_mut((element_offset + dst_elem) * byte_stride + byte)
+                    {
+                        *output_byte = tail_data[byte];
+                    }
+                }
+            }
+        }
+
+        remaining_elements -= attr_block_element_count;
+        element_offset += attr_block_element_count;
+    }
+
+    if let Some(filter) = filter {
+        for element in output_bytes.chunks_mut(byte_stride) {
+            filter_element(element, byte_stride, filter);
+        }
+    }
+
+    Some(output_bytes)
 }
 
 #[inline]
@@ -378,17 +475,17 @@ fn filter_element(input: &mut [u8], byte_stride: usize, filter: Filter) {
             z *= normalize_and_multiply;
 
             if byte_stride == 4 {
-                input[0] = approx_round(x) as i8 as u8;
-                input[1] = approx_round(y) as i8 as u8;
-                input[2] = approx_round(z) as i8 as u8;
+                input[0] = x.round() as i8 as u8;
+                input[1] = y.round() as i8 as u8;
+                input[2] = z.round() as i8 as u8;
             } else {
-                let x = approx_round(x) as i16 as u16;
+                let x = x.round() as i16 as u16;
                 input[0..2].copy_from_slice(&x.to_le_bytes());
 
-                let y = approx_round(y) as i16 as u16;
+                let y = y.round() as i16 as u16;
                 input[2..4].copy_from_slice(&y.to_le_bytes());
 
-                let z = approx_round(z) as i16 as u16;
+                let z = z.round() as i16 as u16;
                 input[4..6].copy_from_slice(&z.to_le_bytes());
             }
         }
@@ -410,15 +507,15 @@ fn filter_element(input: &mut [u8], byte_stride: usize, filter: Filter) {
 
             let w = (0.0_f32).max(1.0 - x * x - y * y - z * z).sqrt();
 
-            let x = (approx_round(x * 32767.0) as i16).to_le_bytes();
-            let y = (approx_round(y * 32767.0) as i16).to_le_bytes();
-            let z = (approx_round(z * 32767.0) as i16).to_le_bytes();
-            let w = (approx_round(w * 32767.0) as i16).to_le_bytes();
+            let x = ((x * 32767.0).round() as i16).to_le_bytes();
+            let y = ((y * 32767.0).round() as i16).to_le_bytes();
+            let z = ((z * 32767.0).round() as i16).to_le_bytes();
+            let w = ((w * 32767.0).round() as i16).to_le_bytes();
 
-            let maxcomp = input_3 & 3;
+            let swizzle = (input_3 & 3) + 1;
 
             let range_for_index = |index| {
-                let start = (((maxcomp + 1 + index) % 4) * 2) as usize;
+                let start = (((swizzle + index) % 4) * 2) as usize;
                 start..start + 2
             };
 
@@ -569,6 +666,11 @@ fn decode_vertex_buffer() {
             .collect::<Vec<_>>(),
         expected
     );
+
+    assert_eq!(
+        decompress_attributes_to_vec(&encoded, 4, None, 12).unwrap(),
+        &expected
+    );
 }
 
 #[test]
@@ -591,6 +693,11 @@ fn decode_vertex_buffer_more() {
             .flatten()
             .collect::<Vec<_>>(),
         expected
+    );
+
+    assert_eq!(
+        decompress_attributes_to_vec(&encoded, 16, None, 4).unwrap(),
+        &expected
     );
 }
 
@@ -617,6 +724,11 @@ fn decode_vertex_buffer_more_2() {
             .collect::<Vec<_>>(),
         &expected
     );
+
+    assert_eq!(
+        decompress_attributes_to_vec(&encoded, 16, None, 4).unwrap(),
+        &expected
+    );
 }
 
 #[test]
@@ -635,6 +747,11 @@ fn decode_filter_oct_8() {
             .unwrap()
             .flatten()
             .collect::<Vec<_>>(),
+        &expected
+    );
+
+    assert_eq!(
+        decompress_attributes_to_vec(&encoded, 4, Some(Filter::Octahedral), 4).unwrap(),
         &expected
     );
 }
@@ -656,6 +773,20 @@ fn decode_filter_oct_12() {
     assert_eq!(
         AttributeIterator::<8>::new(&encoded, 4, Some(Filter::Octahedral))
             .unwrap()
+            .flat_map(|bytes| [
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+                u16::from_le_bytes([bytes[2], bytes[3]]),
+                u16::from_le_bytes([bytes[4], bytes[5]]),
+                u16::from_le_bytes([bytes[6], bytes[7]]),
+            ])
+            .collect::<Vec<_>>(),
+        &expected
+    );
+
+    assert_eq!(
+        decompress_attributes_to_vec(&encoded, 4, Some(Filter::Octahedral), 8)
+            .unwrap()
+            .chunks(8)
             .flat_map(|bytes| [
                 u16::from_le_bytes([bytes[0], bytes[1]]),
                 u16::from_le_bytes([bytes[2], bytes[3]]),
@@ -693,6 +824,20 @@ fn decode_filter_quat_12() {
             .collect::<Vec<_>>(),
         &expected
     );
+
+    assert_eq!(
+        decompress_attributes_to_vec(&encoded, 4, Some(Filter::Quaternion), 8)
+            .unwrap()
+            .chunks(8)
+            .flat_map(|bytes| [
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+                u16::from_le_bytes([bytes[2], bytes[3]]),
+                u16::from_le_bytes([bytes[4], bytes[5]]),
+                u16::from_le_bytes([bytes[6], bytes[7]]),
+            ])
+            .collect::<Vec<_>>(),
+        &expected
+    );
 }
 
 #[test]
@@ -718,17 +863,38 @@ fn decode_filter_exp() {
             .collect::<Vec<_>>(),
         &expected
     );
+
+    assert_eq!(
+        decompress_attributes_to_vec(&encoded, 1, Some(Filter::Exponential), 16)
+            .unwrap()
+            .chunks(16)
+            .flat_map(|bytes| [
+                u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            ])
+            .collect::<Vec<_>>(),
+        &expected
+    );
 }
 
 #[test]
 fn decode_real_vertex_buffer() {
     let compressed_bytes = std::fs::read("test_data/vertex_buffer.compressed.bin").unwrap();
 
-    assert_eq!(
+    let decompressed: Vec<u8> =
         AttributeIterator::<4>::new(&compressed_bytes, 3678936, Some(Filter::Octahedral))
             .unwrap()
-            .count(),
-        3678936
+            .flatten()
+            .collect();
+
+    assert_eq!(decompressed.len(), 3678936 * 4);
+
+    assert_eq!(
+        decompress_attributes_to_vec(&compressed_bytes, 3678936, Some(Filter::Octahedral), 4)
+            .unwrap(),
+        decompressed
     );
 }
 
